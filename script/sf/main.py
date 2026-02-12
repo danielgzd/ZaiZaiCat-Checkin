@@ -346,6 +346,7 @@ class SFTasksManager:
             'total_tasks': 0,
             'completed_tasks': 0,
             'total_points': 0,
+            'available_points': None,
             'tasks': []
         }
 
@@ -386,35 +387,45 @@ class SFTasksManager:
 
             if not task_list:
                 logger.warning(f"[{account_name}] 未获取到任务列表")
-                return account_stat
+            else:
+                logger.info(f"[{account_name}] 获取到 {len(task_list)} 个任务")
 
-            logger.info(f"[{account_name}] 获取到 {len(task_list)} 个任务")
+                # 处理每个任务
+                for i, task in enumerate(task_list, 1):
+                    logger.info(f"[{account_name}] 开始处理第 {i}/{len(task_list)} 个任务")
 
-            # 处理每个任务
-            for i, task in enumerate(task_list, 1):
-                logger.info(f"[{account_name}] 开始处理第 {i}/{len(task_list)} 个任务")
+                    if task.get("taskPeriod") != "D":
+                        logger.info(f"[{account_name}] 任务 {task.get('title', '未知任务')} 非日常任务，跳过")
+                        continue
 
-                if task.get("taskPeriod") != "D":
-                    logger.info(f"[{account_name}] 任务 {task.get('title', '未知任务')} 非日常任务，跳过")
-                    continue
+                    account_stat['total_tasks'] += 1
 
-                account_stat['total_tasks'] += 1
+                    # 如果任务已完成，跳过
+                    if task.get("status") == 3:
+                        logger.info(f"[{account_name}] 任务 {task.get('title', '未知任务')} 已完成，跳过")
+                        continue
 
-                # 如果任务已完成，跳过
-                if task.get("status") == 3:
-                    logger.info(f"[{account_name}] 任务 {task.get('title', '未知任务')} 已完成，跳过")
-                    continue
+                    delay_time = random.uniform(*DELAY_BETWEEN_TASKS)
+                    logger.info(f"[{account_name}] 准备执行任务 {task.get('title', '未知任务')}，延时 {delay_time:.2f} 秒...")
+                    time.sleep(delay_time)
 
-                delay_time = random.uniform(*DELAY_BETWEEN_TASKS)
-                logger.info(f"[{account_name}] 准备执行任务 {task.get('title', '未知任务')}，延时 {delay_time:.2f} 秒...")
-                time.sleep(delay_time)
+                    task_result = self.process_single_task(task, sf_api, account_name)
+                    account_stat['tasks'].append(task_result)
 
-                task_result = self.process_single_task(task, sf_api, account_name)
-                account_stat['tasks'].append(task_result)
+                    if task_result.get('success'):
+                        account_stat['completed_tasks'] += 1
+                        account_stat['total_points'] += task_result.get('points', 0)
 
-                if task_result.get('success'):
-                    account_stat['completed_tasks'] += 1
-                    account_stat['total_points'] += task_result.get('points', 0)
+            # 查询账号积分信息（当前积分）
+            user_info_result = sf_api.query_user_info()
+            if user_info_result.get("success"):
+                user_info_obj = user_info_result.get("obj", {})
+                available_points = user_info_obj.get("availablePoints")
+                account_stat['available_points'] = available_points
+                logger.info(f"[{account_name}] 当前积分: {available_points}")
+            else:
+                error_msg = user_info_result.get("errorMessage") or user_info_result.get("error") or "未知错误"
+                logger.warning(f"[{account_name}] 查询当前积分失败: {error_msg}")
 
         except Exception as e:
             logger.error(f"处理账号 {account_name} 时发生错误: {e}")
@@ -487,6 +498,7 @@ class SFTasksManager:
                 sign_days = stat.get('sign_days', 0)
                 completed = stat.get('completed_tasks', 0)
                 points = stat.get('total_points', 0)
+                available_points = stat.get('available_points')
 
                 # 账号摘要
                 if stat.get('error'):
@@ -498,6 +510,8 @@ class SFTasksManager:
                     content_parts.append(f"   📅 连续签到: {sign_days}天")
                     content_parts.append(f"   📝 完成任务: {completed}个")
                     content_parts.append(f"   🎁 获得积分: {points}分")
+                    if available_points is not None:
+                        content_parts.append(f"   💰 当前积分: {available_points}分")
 
                 # 账号之间添加空行
                 if i < len(self.task_summary):

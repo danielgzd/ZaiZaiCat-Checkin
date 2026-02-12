@@ -342,3 +342,26 @@ class SFExpressAPI:
             f"?mobile=176****2621&userId={self.user_id}&path=/superWelfare&supportShare=YES&from=appIndex&tab=1"
         )
         return self._post_json(url_path, data, referer, "自动签到获取礼包请求失败", extra_headers)
+
+    def query_user_info(self) -> Dict[str, Any]:
+        """
+        查询会员积分信息
+
+        Returns:
+            Dict: API响应结果
+        """
+        url_path = "/mcs-mimp/commonPost/~memberIntegral~userInfoService~personalInfoNew"
+        data = {}
+        extra_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "deviceid": self.device_id or "",
+            "priority": "u=3, i",
+            "accept-language": "zh-CN,zh-Hans;q=0.9",
+            "channel": "appqiandao",
+        }
+        referer = (
+            "https://mcs-mimp-web.sf-express.com/home"
+            f"?redirectUri=/myPoints&userId={self.user_id or ''}&from=appqiandao"
+        )
+        return self._post_json(url_path, data, referer, "查询会员积分信息请求失败", extra_headers)
