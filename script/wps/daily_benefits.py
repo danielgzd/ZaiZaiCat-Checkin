@@ -101,6 +101,39 @@ class DailyBenefitsAPI:
         return result.get("msg") or result.get("message") or result.get("error") or "未知错误"
 
     @staticmethod
+    def _normalize_server_time(server_time: Any) -> int:
+        """兼容秒和毫秒时间戳。"""
+        try:
+            timestamp = int(server_time)
+        except (TypeError, ValueError):
+            return 0
+
+        if timestamp > 10 ** 12:
+            timestamp //= 1000
+        return timestamp
+
+    @classmethod
+    def _resolve_sign_date(cls, item: Dict[str, Any], sign_records: List[Dict[str, Any]]) -> str:
+        """优先使用服务端时间推导签到日期，缺失时回退到记录中的最新日期。"""
+        server_time = cls._normalize_server_time(item.get("server_time", 0))
+        if server_time:
+            return time.strftime("%Y-%m-%d", time.localtime(server_time))
+
+        today = time.strftime("%Y-%m-%d")
+        if any(record.get("sign_date") == today for record in sign_records):
+            return today
+
+        if sign_records:
+            return sign_records[0].get("sign_date", today)
+
+        return today
+
+    @staticmethod
+    def _count_signed_days(sign_records: List[Dict[str, Any]]) -> int:
+        """统计当前系列已签到天数。"""
+        return sum(1 for record in sign_records if record.get("sign_status") == "signed")
+
+    @staticmethod
     def _is_auth_expired_message(message: str) -> bool:
         keywords = ("Token已过期", "ErrNotLogin", "userNotLogin", "未登录", "请重新登录")
         return any(keyword in str(message) for keyword in keywords)
@@ -444,16 +477,12 @@ class DailyBenefitsAPI:
             if fallback_item is None:
                 fallback_item = item
 
-            server_time = item.get("server_time", 0)
-            sign_date = (
-                time.strftime("%Y-%m-%d", time.localtime(server_time))
-                if server_time
-                else time.strftime("%Y-%m-%d")
-            )
+            sign_date = self._resolve_sign_date(item, sign_records)
             today_record = next(
                 (record for record in sign_records if record.get("sign_date") == sign_date),
                 None
             )
+            sign_series_id = fragment_collect.get("sign_series_id", "")
 
             if item.get("type") == 42 or today_record is not None:
                 return {
@@ -461,9 +490,11 @@ class DailyBenefitsAPI:
                     "component_number": item.get("number", ""),
                     "component_node_id": item.get("component_node_id", ""),
                     "sign_date": sign_date,
-                    "sign_series_id": fragment_collect.get("sign_series_id", ""),
+                    "sign_series_id": sign_series_id,
+                    "is_new_sign_series": not bool(sign_series_id),
                     "is_signed": (today_record or {}).get("sign_status") == "signed",
                     "today_record": today_record or {},
+                    "signed_days": self._count_signed_days(sign_records),
                     "sign_records": sign_records,
                     "raw_data": fragment_collect
                 }
@@ -471,19 +502,22 @@ class DailyBenefitsAPI:
         if fallback_item is not None:
             fragment_collect = fallback_item.get("fragment_collect", {})
             sign_records = fragment_collect.get("sign_records") or []
-            sign_date = sign_records[0].get("sign_date", time.strftime("%Y-%m-%d")) if sign_records else time.strftime("%Y-%m-%d")
+            sign_date = self._resolve_sign_date(fallback_item, sign_records)
             today_record = next(
                 (record for record in sign_records if record.get("sign_date") == sign_date),
                 None
             )
+            sign_series_id = fragment_collect.get("sign_series_id", "")
             return {
                 "success": True,
                 "component_number": fallback_item.get("number", ""),
                 "component_node_id": fallback_item.get("component_node_id", ""),
                 "sign_date": sign_date,
-                "sign_series_id": fragment_collect.get("sign_series_id", ""),
+                "sign_series_id": sign_series_id,
+                "is_new_sign_series": not bool(sign_series_id),
                 "is_signed": (today_record or {}).get("sign_status") == "signed",
                 "today_record": today_record or {},
+                "signed_days": self._count_signed_days(sign_records),
                 "sign_records": sign_records,
                 "raw_data": fragment_collect
             }
@@ -498,7 +532,9 @@ class DailyBenefitsAPI:
         portal_info: Dict[str, Any],
         component_number: str,
         component_node_id: str,
-        sign_date: str
+        sign_date: str,
+        sign_series_id: str,
+        is_new_sign_series: bool
     ) -> Dict[str, Any]:
         """执行打卡免费领会员签到"""
         csrf_token = self.cookies.get("act_csrf_token") or self.cookies.get("csrf")
@@ -520,8 +556,8 @@ class DailyBenefitsAPI:
             "component_action": "fragment_collect.sign_in",
             "fragment_collect": {
                 "sign_date": sign_date,
-                "series_id": "",
-                "is_new_sign_series": True
+                "series_id": sign_series_id,
+                "is_new_sign_series": is_new_sign_series
             }
         }
 
@@ -761,6 +797,40 @@ class DailyBenefitsTasks:
         else:
             self.logger.warning("配置文件中没有找到 WPS 账号信息")
 
+    @staticmethod
+    def _sync_free_member_checkin_state(
+        free_member_checkin: Dict[str, Any],
+        fragment_result: Dict[str, Any]
+    ) -> None:
+        """将页面最新签到状态回填到汇总结果。"""
+        today_record = fragment_result.get("today_record", {})
+        free_member_checkin["sign_date"] = fragment_result.get("sign_date", "")
+        free_member_checkin["sign_status"] = today_record.get("sign_status", "")
+        free_member_checkin["reward_title"] = today_record.get("reward_title", "")
+        free_member_checkin["signed_days"] = fragment_result.get("signed_days", 0)
+        free_member_checkin["sign_series_id"] = fragment_result.get("sign_series_id", "")
+
+    @staticmethod
+    def _build_free_member_checkin_message(
+        free_member_checkin: Dict[str, Any],
+        *,
+        signed_now: bool = False
+    ) -> str:
+        """统一生成打卡免费领会员模块文案。"""
+        sign_date = free_member_checkin.get("sign_date", "")
+        signed_days = free_member_checkin.get("signed_days", 0)
+        reward_title = free_member_checkin.get("reward_title", "")
+        sign_status = free_member_checkin.get("sign_status", "")
+
+        if sign_status == "signed":
+            day_text = f"连续第 {signed_days} 天" if signed_days else sign_date
+            reward_text = f"，奖励: {reward_title}" if reward_title else ""
+            if signed_now:
+                return f"打卡免费领会员签到成功，{day_text}（{sign_date}）{reward_text}"
+            return f"打卡免费领会员今日已签到，{day_text}（{sign_date}）{reward_text}"
+
+        return f"打卡免费领会员待签到（{sign_date}）"
+
     def _process_member_trial(
         self,
         api: DailyBenefitsAPI,
@@ -913,40 +983,41 @@ class DailyBenefitsTasks:
                 "refresh_page_info": False
             }
 
-        today_record = fragment_result.get("today_record", {})
-        result["free_member_checkin"]["sign_date"] = fragment_result["sign_date"]
-        result["free_member_checkin"]["sign_status"] = today_record.get("sign_status", "")
-        result["free_member_checkin"]["reward_title"] = today_record.get("reward_title", "")
+        self._sync_free_member_checkin_state(result["free_member_checkin"], fragment_result)
 
         if fragment_result["is_signed"]:
-            message = f"打卡免费领会员今日已签到（{fragment_result['sign_date']}）"
+            message = self._build_free_member_checkin_message(result["free_member_checkin"])
             result["free_member_checkin"]["message"] = message
             return {
                 "success": True,
                 "message": message,
-                "refresh_page_info": False
+                "refresh_page_info": False,
+                "signed_now": False
             }
 
         checkin_logger.info(
-            "开始执行打卡签到，日期=%s",
-            fragment_result["sign_date"]
+            "开始执行打卡签到，日期=%s, series_id=%s, is_new=%s",
+            fragment_result["sign_date"],
+            fragment_result.get("sign_series_id", ""),
+            fragment_result.get("is_new_sign_series", True)
         )
         sign_in_result = api.sign_in_fragment_collect(
             portal_info=portal_result,
             component_number=fragment_result["component_number"],
             component_node_id=fragment_result["component_node_id"],
-            sign_date=fragment_result["sign_date"]
+            sign_date=fragment_result["sign_date"],
+            sign_series_id=fragment_result.get("sign_series_id", ""),
+            is_new_sign_series=fragment_result.get("is_new_sign_series", True)
         )
 
         if sign_in_result["success"]:
-            reward_title = today_record.get("reward_title", "签到奖励")
-            message = f"打卡免费领会员签到成功，奖励: {reward_title}"
-            result["free_member_checkin"]["sign_status"] = "signed"
+            message = "打卡免费领会员签到成功，正在刷新签到状态"
             result["free_member_checkin"]["message"] = message
             return {
                 "success": True,
                 "message": message,
-                "refresh_page_info": True
+                "refresh_page_info": True,
+                "signed_now": True
             }
 
         message = sign_in_result.get("error", "打卡签到失败")
@@ -1083,6 +1154,8 @@ class DailyBenefitsTasks:
                 "sign_date": "",
                 "sign_status": "",
                 "reward_title": "",
+                "signed_days": 0,
+                "sign_series_id": "",
                 "message": ""
             },
             "member_trial": {
@@ -1153,6 +1226,27 @@ class DailyBenefitsTasks:
             refreshed_page_info_result = api.get_page_info(portal_result)
             if refreshed_page_info_result["success"]:
                 current_page_info = refreshed_page_info_result["data"]
+                refreshed_fragment_result = api.get_fragment_collect_info(current_page_info)
+                if refreshed_fragment_result["success"]:
+                    self._sync_free_member_checkin_state(
+                        result["free_member_checkin"],
+                        refreshed_fragment_result
+                    )
+                    fragment_collect_status["message"] = self._build_free_member_checkin_message(
+                        result["free_member_checkin"],
+                        signed_now=fragment_collect_status.get("signed_now", False)
+                    )
+                    result["free_member_checkin"]["message"] = fragment_collect_status["message"]
+                else:
+                    refresh_error = refreshed_fragment_result["error"]
+                    fragment_collect_status = {
+                        "success": False,
+                        "message": (
+                            f"{fragment_collect_status['message']}，"
+                            f"但刷新后的签到状态解析失败: {refresh_error}"
+                        )
+                    }
+                    result["free_member_checkin"]["message"] = fragment_collect_status["message"]
             else:
                 refresh_error = refreshed_page_info_result["error"]
                 fragment_collect_status = {
