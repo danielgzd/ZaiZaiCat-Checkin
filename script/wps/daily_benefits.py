@@ -134,6 +134,14 @@ class DailyBenefitsAPI:
         return sum(1 for record in sign_records if record.get("sign_status") == "signed")
 
     @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """将接口返回的数字字段安全转为 int。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
     def _is_auth_expired_message(message: str) -> bool:
         keywords = ("Token已过期", "ErrNotLogin", "userNotLogin", "未登录", "请重新登录")
         return any(keyword in str(message) for keyword in keywords)
@@ -642,13 +650,15 @@ class DailyBenefitsAPI:
                 fallback_session = selected_session
 
             if selected_session.get("session_status") == "IN_PROGRESS":
+                sign_day = self._safe_int(selected_session.get("times", 0))
                 return {
                     "success": True,
                     "component_number": item.get("number", ""),
                     "component_node_id": item.get("component_node_id", ""),
                     "session_id": selected_session.get("session_id"),
                     "session_name": selected_session.get("session_name", ""),
-                    "remain_times": selected_session.get("times", 0),
+                    "remain_times": sign_day,
+                    "sign_day": sign_day,
                     "stock_status": selected_session.get("stock_status", ""),
                     "share_times": lottery_v2.get("share_times", False),
                     "share_times_count": lottery_v2.get("share_times_count", 0),
@@ -658,13 +668,15 @@ class DailyBenefitsAPI:
 
         if fallback_item is not None and fallback_session is not None:
             lottery_v2 = fallback_item.get("lottery_v2", {})
+            sign_day = self._safe_int(fallback_session.get("times", 0))
             return {
                 "success": True,
                 "component_number": fallback_item.get("number", ""),
                 "component_node_id": fallback_item.get("component_node_id", ""),
                 "session_id": fallback_session.get("session_id"),
                 "session_name": fallback_session.get("session_name", ""),
-                "remain_times": fallback_session.get("times", 0),
+                "remain_times": 0,
+                "sign_day": sign_day,
                 "stock_status": fallback_session.get("stock_status", ""),
                 "share_times": lottery_v2.get("share_times", False),
                 "share_times_count": lottery_v2.get("share_times_count", 0),
@@ -750,6 +762,91 @@ class DailyBenefitsAPI:
             failure_result["error_type"] = "token_expired"
         return failure_result
 
+    def receive_daily_lottery_reward(
+        self,
+        portal_info: Dict[str, Any],
+        component_number: str,
+        component_node_id: str,
+        sign_series_id: str
+    ) -> Dict[str, Any]:
+        """领取天天福利第 7 天奖励"""
+        csrf_token = self.cookies.get("act_csrf_token") or self.cookies.get("csrf")
+        if not csrf_token:
+            return {
+                "success": False,
+                "error": "Cookie 中缺少 act_csrf_token/csrf，无法领取第7天奖励"
+            }
+
+        payload = {
+            "component_uniq_number": {
+                "activity_number": portal_info["activity_number"],
+                "page_number": portal_info["page_number"],
+                "component_number": component_number,
+                "component_node_id": component_node_id,
+                "filter_params": portal_info.get("filter_params", {})
+            },
+            "component_type": 42,
+            "component_action": "fragment_collect.receive",
+            "fragment_collect": {
+                "series_id": sign_series_id
+            }
+        }
+
+        result = self._request(
+            "POST",
+            self.COMPONENT_ACTION_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-act-csrf-token": csrf_token,
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+                "referer": portal_info["link"]
+            },
+            json_data=payload
+        )
+
+        if not result["success"]:
+            return result
+
+        payload_data = result["data"]
+        if payload_data.get("result") != "ok":
+            return self._build_failure_result(payload_data)
+
+        action_data = payload_data.get("data", {}).get("fragment_collect", {})
+        if not action_data:
+            action_data = payload_data.get("data", {}).get("lottery_v2", {})
+
+        if action_data.get("success"):
+            return {
+                "success": True,
+                "reason": action_data.get("reason", ""),
+                "reward_name": action_data.get("reward_name", ""),
+                "data": action_data
+            }
+
+        error_message = (
+            action_data.get("reason")
+            or action_data.get("send_msg")
+            or action_data.get("message")
+            or "领取第7天奖励失败"
+        )
+        failure_result = {
+            "success": False,
+            "error": error_message,
+            "data": action_data,
+            "payload_summary": {
+                "component_type": payload["component_type"],
+                "component_action": payload["component_action"],
+                "component_number": component_number,
+                "component_node_id": component_node_id,
+                "sign_series_id": sign_series_id
+            }
+        }
+        if self._is_auth_expired_message(failure_result["error"]):
+            failure_result["error_type"] = "token_expired"
+        return failure_result
+
 
 class DailyBenefitsTasks:
     """天天领福利活动任务执行器"""
@@ -777,6 +874,14 @@ class DailyBenefitsTasks:
     def _is_auth_expired_message(message: str) -> bool:
         keywords = ("Token已过期", "ErrNotLogin", "userNotLogin", "未登录", "请重新登录")
         return any(keyword in str(message) for keyword in keywords)
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """将接口返回的数字字段安全转为 int。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def _init_accounts(self) -> None:
         """读取 WPS 账号配置"""
@@ -830,6 +935,122 @@ class DailyBenefitsTasks:
             return f"打卡免费领会员今日已签到，{day_text}（{sign_date}）{reward_text}"
 
         return f"打卡免费领会员待签到（{sign_date}）"
+
+    @staticmethod
+    def _summarize_lottery_item(index: int, item: Dict[str, Any]) -> Dict[str, Any]:
+        """提取 lottery_v2 中用于排查签到/领取顺序的安全字段。"""
+        lottery_v2 = item.get("lottery_v2") or {}
+        lottery_list = lottery_v2.get("lottery_list") or []
+        return {
+            "index": index,
+            "type": item.get("type"),
+            "number": item.get("number", ""),
+            "component_node_id": item.get("component_node_id", ""),
+            "sessions": [
+                {
+                    "session_id": session.get("session_id", ""),
+                    "session_name": session.get("session_name", ""),
+                    "session_status": session.get("session_status", ""),
+                    "stock_status": session.get("stock_status", ""),
+                    "times": session.get("times", 0),
+                    "reward_names": [
+                        reward.get("reward_name", "")
+                        for reward in session.get("lottery_reward_list", [])
+                        if reward.get("reward_name")
+                    ]
+                }
+                for session in lottery_list
+                if isinstance(session, dict)
+            ],
+            "share_times": lottery_v2.get("share_times", False),
+            "share_times_count": lottery_v2.get("share_times_count", 0)
+        }
+
+    @staticmethod
+    def _summarize_fragment_item(index: int, item: Dict[str, Any]) -> Dict[str, Any]:
+        """提取 fragment_collect 中用于排查签到/领取顺序的安全字段。"""
+        fragment_collect = item.get("fragment_collect") or {}
+        sign_records = fragment_collect.get("sign_records") or []
+        return {
+            "index": index,
+            "type": item.get("type"),
+            "number": item.get("number", ""),
+            "component_node_id": item.get("component_node_id", ""),
+            "sign_series_id": fragment_collect.get("sign_series_id", ""),
+            "signed_days_from_records": DailyBenefitsAPI._count_signed_days(sign_records),
+            "sign_records": [
+                {
+                    "sign_date": record.get("sign_date", ""),
+                    "sign_status": record.get("sign_status", ""),
+                    "reward_title": record.get("reward_title", "")
+                }
+                for record in sign_records
+                if isinstance(record, dict)
+            ]
+        }
+
+    @classmethod
+    def _build_page_diagnostics(
+        cls,
+        page_info: Dict[str, Any],
+        fragment_result: Optional[Dict[str, Any]] = None,
+        lottery_result: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """生成不含 Cookie/Token 的页面状态诊断摘要。"""
+        data_list = page_info.get("data", [])
+        if not isinstance(data_list, list):
+            data_list = []
+
+        lottery_items = [
+            cls._summarize_lottery_item(index, item)
+            for index, item in enumerate(data_list)
+            if isinstance(item, dict) and isinstance(item.get("lottery_v2"), dict)
+        ]
+        fragment_items = [
+            cls._summarize_fragment_item(index, item)
+            for index, item in enumerate(data_list)
+            if isinstance(item, dict) and isinstance(item.get("fragment_collect"), dict)
+        ]
+        item_43 = data_list[43] if len(data_list) > 43 and isinstance(data_list[43], dict) else {}
+
+        diagnostics = {
+            "data_count": len(data_list),
+            "item_43": {
+                "keys": list(item_43.keys()) if item_43 else [],
+                "lottery_v2": cls._summarize_lottery_item(43, item_43) if item_43.get("lottery_v2") else {},
+                "fragment_collect": cls._summarize_fragment_item(43, item_43) if item_43.get("fragment_collect") else {}
+            },
+            "fragment_result": {
+                key: fragment_result.get(key)
+                for key in [
+                    "success",
+                    "sign_date",
+                    "sign_series_id",
+                    "is_new_sign_series",
+                    "is_signed",
+                    "signed_days"
+                ]
+            } if fragment_result else {},
+            "lottery_result": {
+                key: lottery_result.get(key)
+                for key in [
+                    "success",
+                    "session_id",
+                    "session_name",
+                    "remain_times",
+                    "sign_day",
+                    "stock_status"
+                ]
+            } if lottery_result else {},
+            "fragment_items": fragment_items,
+            "lottery_items": lottery_items
+        }
+        return diagnostics
+
+    @staticmethod
+    def _format_diagnostics(diagnostics: Dict[str, Any]) -> str:
+        """格式化诊断摘要，保持日志单行输出。"""
+        return json.dumps(diagnostics, ensure_ascii=False, default=str, separators=(",", ":"))
 
     def _process_member_trial(
         self,
@@ -1027,6 +1248,14 @@ class DailyBenefitsTasks:
         ):
             result["auth_expired"] = True
             message = "Token已过期，请重新登录"
+        checkin_logger.info(
+            "打卡失败响应诊断: %s",
+            self._format_diagnostics({
+                "message": message,
+                "response_data": sign_in_result.get("data", {}),
+                "page_state": self._build_page_diagnostics(page_info, fragment_result=fragment_result)
+            })
+        )
         result["free_member_checkin"]["message"] = message
         return {
             "success": False,
@@ -1059,6 +1288,7 @@ class DailyBenefitsTasks:
         result["daily_lottery"]["session_id"] = session_id
         result["daily_lottery"]["session_name"] = daily_lottery_result.get("session_name", "")
         result["daily_lottery"]["stock_status"] = daily_lottery_result.get("stock_status", "")
+        result["daily_lottery"]["sign_day"] = daily_lottery_result.get("sign_day", 0)
         result["daily_lottery"]["reward_pool"] = [
             reward.get("reward_name", "")
             for reward in daily_lottery_result.get("lottery_reward_list", [])
@@ -1132,9 +1362,224 @@ class DailyBenefitsTasks:
             message = f"天天抽奖失败，共尝试 {total_attempts} 次"
             success = False
 
+        if success_count > 0:
+            reward_claim_status = self._process_daily_lottery_reward_claim(
+                api=api,
+                portal_result=portal_result,
+                account_name=account_name,
+                result=result
+            )
+            if reward_claim_status["message"]:
+                message = f"{message}，{reward_claim_status['message']}"
+            success = success and reward_claim_status["success"]
+
         result["daily_lottery"]["message"] = message
         return {
             "success": success,
+            "message": message
+        }
+
+    def _claim_daily_lottery_reward_if_ready(
+        self,
+        api: DailyBenefitsAPI,
+        portal_result: Dict[str, Any],
+        page_info: Dict[str, Any],
+        account_name: str,
+        result: Dict[str, Any],
+        *,
+        force_claim: bool = False,
+        fragment_result: Optional[Dict[str, Any]] = None,
+        include_skip_message: bool = False
+    ) -> Dict[str, Any]:
+        """当前页面已满足第 7 天条件时领取奖励。"""
+        claim_logger = bind_logger(self.logger, account=account_name, step="第7天奖励")
+        reward_claim = result["daily_lottery"].setdefault(
+            "reward_claim",
+            {
+                "attempted": False,
+                "success": False,
+                "message": ""
+            }
+        )
+
+        lottery_result = api.get_daily_lottery_info(page_info)
+        if not lottery_result["success"]:
+            message = f"第7天奖励状态解析失败: {lottery_result['error']}"
+            reward_claim["message"] = message
+            return {
+                "success": False,
+                "message": message,
+                "claimed": False
+            }
+
+        if fragment_result is None:
+            fragment_result = api.get_fragment_collect_info(page_info)
+        if not fragment_result["success"]:
+            message = f"第7天奖励签到状态解析失败: {fragment_result['error']}"
+            reward_claim["message"] = message
+            return {
+                "success": False,
+                "message": message,
+                "claimed": False
+            }
+
+        result["daily_lottery"]["sign_day"] = lottery_result.get("sign_day", 0)
+        sign_day = lottery_result.get("sign_day", 0)
+        if not force_claim and sign_day != 7:
+            message = ""
+            if include_skip_message and sign_day > 0:
+                message = f"当前签到第 {sign_day} 天，未到第 7 天领取条件"
+            return {
+                "success": True,
+                "message": message,
+                "claimed": False
+            }
+
+        reward_claim["attempted"] = True
+        claim_logger.info("当前签到第 7 天，开始领取奖励")
+        receive_result = api.receive_daily_lottery_reward(
+            portal_info=portal_result,
+            component_number=fragment_result["component_number"],
+            component_node_id=fragment_result["component_node_id"],
+            sign_series_id=fragment_result.get("sign_series_id", "")
+        )
+
+        if receive_result["success"]:
+            reward_name = receive_result.get("reward_name", "")
+            message = receive_result.get("reason")
+            if not message:
+                message = f"第7天奖励领取成功: {reward_name}" if reward_name else "第7天奖励领取成功"
+            reward_claim["success"] = True
+            reward_claim["message"] = message
+            return {
+                "success": True,
+                "message": message,
+                "claimed": True
+            }
+
+        message = receive_result.get("error", "第7天奖励领取失败")
+        if (
+            receive_result.get("error_type") == "token_expired"
+            or self._is_auth_expired_message(message)
+        ):
+            result["auth_expired"] = True
+            message = "Token已过期，请重新登录"
+        claim_logger.info(
+            "第7天奖励领取失败诊断: %s",
+            self._format_diagnostics({
+                "message": message,
+                "response_data": receive_result.get("data", {}),
+                "payload_summary": receive_result.get("payload_summary", {})
+            })
+        )
+
+        reward_claim["success"] = False
+        reward_claim["message"] = message
+        return {
+            "success": False,
+            "message": message,
+            "claimed": False
+        }
+
+    def _process_daily_lottery_reward_claim(
+        self,
+        api: DailyBenefitsAPI,
+        portal_result: Dict[str, Any],
+        account_name: str,
+        result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """刷新签到天数，并在第 7 天领取奖励。"""
+        claim_logger = bind_logger(self.logger, account=account_name, step="第7天奖励")
+        reward_claim = result["daily_lottery"].setdefault(
+            "reward_claim",
+            {
+                "attempted": False,
+                "success": False,
+                "message": ""
+            }
+        )
+
+        refreshed_page_info_result = api.get_page_info(portal_result)
+        if not refreshed_page_info_result["success"]:
+            message = f"刷新签到天数失败: {refreshed_page_info_result['error']}"
+            reward_claim["message"] = message
+            return {
+                "success": False,
+                "message": message
+            }
+
+        refreshed_lottery_result = api.get_daily_lottery_info(refreshed_page_info_result["data"])
+        if not refreshed_lottery_result["success"]:
+            message = f"刷新后的签到天数解析失败: {refreshed_lottery_result['error']}"
+            reward_claim["message"] = message
+            return {
+                "success": False,
+                "message": message
+            }
+        refreshed_fragment_result = api.get_fragment_collect_info(refreshed_page_info_result["data"])
+        if not refreshed_fragment_result["success"]:
+            message = f"刷新后的领取组件解析失败: {refreshed_fragment_result['error']}"
+            reward_claim["message"] = message
+            return {
+                "success": False,
+                "message": message
+            }
+
+        sign_day = refreshed_lottery_result.get("sign_day", 0)
+        result["daily_lottery"]["sign_day"] = sign_day
+        signed_days = self._safe_int(refreshed_fragment_result.get("signed_days", 0))
+        if signed_days < 7:
+            if signed_days <= 0:
+                return {
+                    "success": True,
+                    "message": ""
+                }
+            return {
+                "success": True,
+                "message": f"当前签到第 {signed_days} 天，未到第 7 天领取条件"
+            }
+
+        reward_claim["attempted"] = True
+        claim_logger.info("当前签到第 7 天，开始领取奖励")
+        receive_result = api.receive_daily_lottery_reward(
+            portal_info=portal_result,
+            component_number=refreshed_fragment_result["component_number"],
+            component_node_id=refreshed_fragment_result["component_node_id"],
+            sign_series_id=refreshed_fragment_result.get("sign_series_id", "")
+        )
+
+        if receive_result["success"]:
+            reward_name = receive_result.get("reward_name", "")
+            message = receive_result.get("reason")
+            if not message:
+                message = f"第7天奖励领取成功: {reward_name}" if reward_name else "第7天奖励领取成功"
+            reward_claim["success"] = True
+            reward_claim["message"] = message
+            return {
+                "success": True,
+                "message": message
+            }
+
+        message = receive_result.get("error", "第7天奖励领取失败")
+        if (
+            receive_result.get("error_type") == "token_expired"
+            or self._is_auth_expired_message(message)
+        ):
+            result["auth_expired"] = True
+            message = "Token已过期，请重新登录"
+        claim_logger.info(
+            "第7天奖励领取失败诊断: %s",
+            self._format_diagnostics({
+                "message": message,
+                "response_data": receive_result.get("data", {}),
+                "payload_summary": receive_result.get("payload_summary", {})
+            })
+        )
+
+        reward_claim["success"] = False
+        reward_claim["message"] = message
+        return {
+            "success": False,
             "message": message
         }
 
@@ -1169,8 +1614,14 @@ class DailyBenefitsTasks:
                 "session_id": "",
                 "session_name": "",
                 "stock_status": "",
+                "sign_day": 0,
                 "reward_pool": [],
                 "attempts": [],
+                "reward_claim": {
+                    "attempted": False,
+                    "success": False,
+                    "message": ""
+                },
                 "message": ""
             }
         }
@@ -1214,6 +1665,41 @@ class DailyBenefitsTasks:
             return result
 
         current_page_info = page_info_result["data"]
+        initial_fragment_result = api.get_fragment_collect_info(current_page_info)
+        if (
+            initial_fragment_result["success"]
+            and self._safe_int(initial_fragment_result.get("signed_days", 0)) >= 7
+        ):
+            pending_reward_status = self._claim_daily_lottery_reward_if_ready(
+                api=api,
+                portal_result=portal_result,
+                page_info=current_page_info,
+                account_name=account_name,
+                result=result,
+                force_claim=True,
+                fragment_result=initial_fragment_result
+            )
+            if not pending_reward_status["success"]:
+                result["success"] = False
+                result["message"] = pending_reward_status["message"]
+                result["daily_lottery"]["message"] = pending_reward_status["message"]
+                if result["auth_expired"]:
+                    result["message"] = "Token已过期，请重新登录"
+                log_task_result(account_logger, "🏆 第7天奖励", f"❌ {result['message']}")
+                return result
+
+            if pending_reward_status["claimed"]:
+                refreshed_page_info_result = api.get_page_info(portal_result)
+                if refreshed_page_info_result["success"]:
+                    current_page_info = refreshed_page_info_result["data"]
+                else:
+                    refresh_error = refreshed_page_info_result["error"]
+                    result["success"] = False
+                    result["message"] = f"{pending_reward_status['message']}，但刷新页面信息失败: {refresh_error}"
+                    result["daily_lottery"]["message"] = result["message"]
+                    log_task_result(account_logger, "🏆 第7天奖励", f"❌ {result['message']}")
+                    return result
+
         fragment_collect_status = self._process_fragment_collect_sign_in(
             api=api,
             portal_result=portal_result,
@@ -1367,12 +1853,20 @@ class DailyBenefitsTasks:
 
         daily_lottery = item.get("daily_lottery", {})
         lines.append(f"      剩余抽奖次数: {daily_lottery.get('remain_times', 0)}")
+        if daily_lottery.get("sign_day"):
+            lines.append(f"      当前签到天数: 第 {daily_lottery.get('sign_day')} 天")
         lottery_attempts = daily_lottery.get("attempts", [])
         if lottery_attempts:
             lines.append("      抽奖结果:")
             for attempt in lottery_attempts:
                 attempt_status = "成功" if attempt["success"] else "失败"
                 lines.append(f"        第{attempt['index']}次 {attempt_status}: {attempt['message']}")
+        reward_claim = daily_lottery.get("reward_claim", {})
+        if reward_claim.get("message"):
+            claim_status = "成功" if reward_claim.get("success") else "失败"
+            if not reward_claim.get("attempted"):
+                claim_status = "跳过"
+            lines.append(f"      第7天奖励领取: {claim_status} - {reward_claim.get('message', '')}")
 
         return lines
 
@@ -1442,6 +1936,8 @@ class DailyBenefitsTasks:
 
             daily_lottery = item.get("daily_lottery", {})
             content_lines.append(f"    🎰 剩余抽奖次数: {daily_lottery.get('remain_times', 0)}")
+            if daily_lottery.get("sign_day"):
+                content_lines.append(f"    📆 当前签到天数: 第 {daily_lottery.get('sign_day')} 天")
 
             lottery_attempts = daily_lottery.get("attempts", [])
             if lottery_attempts:
@@ -1451,6 +1947,15 @@ class DailyBenefitsTasks:
                     content_lines.append(
                         f"       第{attempt['index']}次 {attempt_status}: {attempt['message']}"
                     )
+
+            reward_claim = daily_lottery.get("reward_claim", {})
+            if reward_claim.get("message"):
+                claim_status = "成功" if reward_claim.get("success") else "失败"
+                if not reward_claim.get("attempted"):
+                    claim_status = "跳过"
+                content_lines.append(
+                    f"    🏆 第7天奖励领取: {claim_status} - {reward_claim.get('message', '')}"
+                )
 
             if item != self.account_results[-1]:
                 content_lines.append("")
